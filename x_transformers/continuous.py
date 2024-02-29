@@ -8,6 +8,7 @@ from x_transformers.x_transformers import (
     AttentionLayers,
     ScaledSinusoidalEmbedding,
     AbsolutePositionalEmbedding,
+    LayerNorm,
     always,
     pad_at_dim
 )
@@ -46,15 +47,17 @@ class ContinuousTransformerWrapper(nn.Module):
         self.max_seq_len = max_seq_len
 
         self.max_mem_len = max_mem_len
+        
+        no_abs_pos_emb = max_seq_len == 0 or not (use_abs_pos_emb and not attn_layers.disable_abs_pos_emb)
 
-        if not (use_abs_pos_emb and not attn_layers.has_pos_emb):
+        if no_abs_pos_emb:
             self.pos_emb = always(0)
         elif scaled_sinu_pos_emb:
             self.pos_emb = ScaledSinusoidalEmbedding(dim)
         else:
             self.pos_emb = AbsolutePositionalEmbedding(dim, max_seq_len)
 
-        self.post_emb_norm = nn.LayerNorm(dim) if post_emb_norm else nn.Identity()
+        self.post_emb_norm = LayerNorm(dim) if post_emb_norm else nn.Identity()
         self.emb_dropout = nn.Dropout(emb_dropout)
 
         # memory tokens
@@ -71,8 +74,8 @@ class ContinuousTransformerWrapper(nn.Module):
 
         # project in and out
 
-        self.project_in = nn.Linear(dim_in, dim) if exists(dim_in) else nn.Identity()
-        self.project_out = nn.Linear(dim, dim_out) if exists(dim_out) else nn.Identity()
+        self.project_in = nn.Linear(dim_in, dim, bias = False) if exists(dim_in) else nn.Identity()
+        self.project_out = nn.Linear(dim, dim_out, bias = False) if exists(dim_out) else nn.Identity()
 
     def forward(
         self,
@@ -83,6 +86,7 @@ class ContinuousTransformerWrapper(nn.Module):
         mask = None,
         return_attn = False,
         mems = None,
+        mem_masks = None,
         pos = None,
         prepend_embeds = None,
         prepend_mask = None,
@@ -124,7 +128,7 @@ class ContinuousTransformerWrapper(nn.Module):
 
         # attention layers
 
-        x, intermediates = self.attn_layers(x, mask = mask, mems = mems, return_hiddens = True, **kwargs)
+        x, intermediates = self.attn_layers(x, mask = mask, mems = mems, mem_masks = mem_masks, return_hiddens = True, **kwargs)
 
         # splice out memory tokens
 

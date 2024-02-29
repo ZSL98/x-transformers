@@ -145,7 +145,7 @@ class AutoregressiveWrapper(Module):
         cache_kv = True,
         **kwargs
     ):
-        max_seq_len, device = self.max_seq_len, prompts.device
+        max_seq_len, greedy, device = self.max_seq_len, temperature == 0., prompts.device
 
         prompts, ps = pack([prompts], '* n')
 
@@ -191,8 +191,10 @@ class AutoregressiveWrapper(Module):
         for _ in range(3):
             print("exist cache: ", exists(cache))
             if restrict_to_max_seq_len:
-                # print("max_seq_len: ", max_seq_len)
-                # print("out shape: ", out.shape)
+                max_len_exceeded = out.shape[-1] > max_seq_len
+
+                assert not (cache_kv and max_len_exceeded and not self.net.can_cache_kv_outside_max_seq_len), 'the network cannot use cached key values when decoding outside the max sequence length. most likely because you are using absolute positional embeeding. you can switch to rotary embeddings to resolve this issue'
+
                 x = out[:, -max_seq_len:]
 
                 if exists(cache):
@@ -237,24 +239,28 @@ class AutoregressiveWrapper(Module):
 
             # filter by top_k, top_p (nucleus), top_a, or custom
 
-            filtered_logits = filter_logits_fn(logits, **filter_kwargs)
+            if greedy:
+                sample = logits.argmax(dim = -1, keepdim = True)
+            else:
+                filtered_logits = filter_logits_fn(logits, **filter_kwargs)
+                probs = F.softmax(filtered_logits / temperature, dim=-1)
+                sample = torch.multinomial(probs, 1)
 
-            probs = F.softmax(filtered_logits / temperature, dim=-1)
-
-            sample = torch.multinomial(probs, 1)
+            # concat sample
 
             out = torch.cat((out, sample), dim=-1)
-            # print(out.shape)
 
             if exists(eos_token):
                 is_eos_tokens = (out == eos_token)
 
-                if is_eos_tokens.any(dim = -1).all():
-                    # mask out everything after the eos tokens
-                    shifted_is_eos_tokens = F.pad(is_eos_tokens, (1, -1))
-                    mask = shifted_is_eos_tokens.float().cumsum(dim = -1) >= 1
-                    out = out.masked_fill(mask, self.pad_value)
-                    break
+            if is_eos_tokens.any(dim = -1).all():
+                break
+
+        if exists(eos_token):
+            # mask out everything after the eos tokens
+            shifted_is_eos_tokens = F.pad(is_eos_tokens, (1, -1))
+            mask = shifted_is_eos_tokens.float().cumsum(dim = -1) >= 1
+            out = out.masked_fill(mask, self.pad_value)
 
         out = out[:, t:]
 

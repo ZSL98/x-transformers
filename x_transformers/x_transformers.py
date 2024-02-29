@@ -1,6 +1,7 @@
 import math
 from random import random
 from typing import Dict
+from packaging import version
 
 import torch
 from torch import nn, einsum, Tensor
@@ -55,6 +56,9 @@ def maybe(fn):
             return x
         return fn(x, *args, **kwargs)
     return inner
+
+def at_most_one_of(*bools):
+    return sum(map(int, bools)) <= 1
 
 class always():
     def __init__(self, val):
@@ -304,7 +308,7 @@ class DynamicPositionBias(nn.Module):
 
         self.mlp.append(Sequential(
             nn.Linear(1, dim),
-            nn.LayerNorm(dim) if norm else None,
+            LayerNorm(dim) if norm else None,
             nn.SiLU()
         ))
 
@@ -434,19 +438,15 @@ class RotaryEmbedding(nn.Module):
 
     @autocast(enabled = False)
     def forward(self, t):
-        device = self.inv_freq.device
+        max_pos = t.max()+1
 
-        t = t.type_as(self.inv_freq)
-
-        t = t / self.interpolation_factor
-
-        freqs = torch.einsum('i , j -> i j', t, self.inv_freq)
+        freqs = torch.einsum('i , j -> i j', t.type_as(self.inv_freq), self.inv_freq) / self.interpolation_factor
         freqs = torch.cat((freqs, freqs), dim = -1)
 
         if not exists(self.scale):
             return freqs, 1.
 
-        power = (torch.arange(seq_len, device = device) - (seq_len // 2)) / self.scale_base
+        power = (t - (max_pos // 2)) / self.scale_base
         scale = self.scale ** rearrange(power, 'n -> n 1')
         scale = torch.cat((scale, scale), dim = -1)
 
@@ -462,6 +462,7 @@ def rotate_half(x):
 def apply_rotary_pos_emb(t, freqs, scale = 1):
     rot_dim, seq_len = freqs.shape[-1], t.shape[-2]
     freqs = freqs[-seq_len:, :]
+    scale = scale[-seq_len:, :] if isinstance(scale, torch.Tensor) else scale
 
     if t.ndim == 4 and freqs.ndim == 3:
         freqs = rearrange(freqs, 'b n d -> b 1 n d')
@@ -497,6 +498,21 @@ class ScaleNorm(nn.Module):
     def forward(self, x):
         norm = torch.norm(x, dim = -1, keepdim = True)
         return x / norm.clamp(min = self.eps) * self.g
+
+class LayerNorm(nn.Module):
+    def __init__(self, dim):
+        """
+        bias-less layernorm has been shown to be more stable. most newer models have moved towards rmsnorm, also bias-less
+        """
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.register_buffer("beta", torch.zeros(dim))
+
+    def forward(self, x):
+        return F.layer_norm(x, x.shape[-1:], self.gamma, self.beta)
+
+if version.parse(torch.__version__) >= version.parse('2.1.0'):
+    LayerNorm = partial(nn.LayerNorm, bias = False)
 
 class RMSNorm(nn.Module):
     def __init__(self, dim):
@@ -634,7 +650,7 @@ class FeedForward(nn.Module):
 
         self.ff = Sequential(
             project_in,
-            nn.LayerNorm(inner_dim) if post_act_ln else None,
+            LayerNorm(inner_dim) if post_act_ln else None,
             nn.Dropout(dropout),
             nn.Linear(inner_dim, dim_out, bias = not no_bias)
         )
@@ -772,8 +788,8 @@ class Attention(nn.Module):
         # add memory key / values
         self.num_mem_kv = num_mem_kv
         if num_mem_kv > 0:
-            self.mem_k = nn.Parameter(torch.randn(heads, num_mem_kv, dim_head))
-            self.mem_v = nn.Parameter(torch.randn(heads, num_mem_kv, dim_head))
+            self.mem_k = nn.Parameter(torch.randn(kv_heads, num_mem_kv, dim_head))
+            self.mem_v = nn.Parameter(torch.randn(kv_heads, num_mem_kv, dim_head))
 
         # attention on attention
         self.attn_on_attn = on_attn
@@ -797,6 +813,7 @@ class Attention(nn.Module):
         rotary_pos_emb = None,
         prev_attn = None,
         mem = None,
+        mem_mask = None,
         return_intermediates = False,
         cache: Optional[Intermediates] = None,
     ):
@@ -868,8 +885,15 @@ class Attention(nn.Module):
         if not exists(input_mask) and not has_context:
             input_mask = mask
 
-            if exists(input_mask) and exists(mem):
-                input_mask = pad_at_dim(input_mask, (mem.shape[-2], 0), dim = -1, value = True)
+            if (exists(input_mask) or exists(mem_mask)) and exists(mem):
+                seq_len, mem_len = n, mem.shape[-2]
+
+                if not exists(mem_mask):
+                    input_mask = pad_at_dim(input_mask, (mem_len, 0), dim = -1, value = True)
+                elif not exists(input_mask):
+                    input_mask = pad_at_dim(mem_mask, (0, seq_len), dim = -1, value = True)
+                else:
+                    input_mask = torch.cat((mem_mask, input_mask), dim = -1)
 
         if self.num_mem_kv > 0:
             mem_k, mem_v = map(lambda t: repeat(t, 'h n d -> b h n d', b = b), (self.mem_k, self.mem_v))
@@ -1022,6 +1046,7 @@ class AttentionLayers(nn.Module):
         zero_init_branch_output = False,
         layer_dropout = 0.,
         cross_attn_tokens_dropout = 0.,
+        disable_abs_pos_emb = None,
         **kwargs
     ):
         super().__init__()
@@ -1038,7 +1063,7 @@ class AttentionLayers(nn.Module):
         self.causal = causal
         self.layers = nn.ModuleList([])
 
-        self.has_pos_emb = rel_pos_bias or rotary_pos_emb
+        self.disable_abs_pos_emb = default(disable_abs_pos_emb, (rel_pos_bias or rotary_pos_emb))
 
         rotary_emb_dim = max(default(rotary_emb_dim, dim_head // 2), 32)
 
@@ -1093,7 +1118,7 @@ class AttentionLayers(nn.Module):
         elif use_simple_rmsnorm:
             norm_class = SimpleRMSNorm
         else:
-            norm_class = nn.LayerNorm
+            norm_class = LayerNorm
 
         norm_fn = partial(norm_class, dim)
 
@@ -1214,6 +1239,7 @@ class AttentionLayers(nn.Module):
         attn_mask = None,
         self_attn_kv_mask = None,
         mems = None,
+        mem_masks = None,
         seq_start_pos: Optional[Tensor] = None,
         cache: Optional[LayerIntermediates] = None,
         cache_age = 1,
@@ -1231,6 +1257,7 @@ class AttentionLayers(nn.Module):
         prev_cross_attn = None
 
         mems = mems.copy() if exists(mems) else [None] * self.num_attn_layers
+        mem_masks = mem_masks.copy() if exists(mem_masks) else [None] * self.num_attn_layers
 
         # handle left padded sequences
 
@@ -1248,8 +1275,11 @@ class AttentionLayers(nn.Module):
         # rotary positions
 
         if not exists(rotary_pos_emb) and exists(self.rotary_pos_emb):
-            max_rotary_emb_length = max(list(map(lambda m: (m.shape[1] if exists(m) else 0) + x.shape[1], mems)))
-            rotary_pos_emb = self.rotary_pos_emb.forward_from_seq_len(max_rotary_emb_length)
+            maybe_mem = mems[0] # todo - handle edge case where different layers get different memory lengths. don't think this will ever come up but who knows
+            mem_len = maybe_mem.shape[1] if exists(maybe_mem) else 0
+
+            pos = torch.arange(x.shape[1] + mem_len, device = x.device) - mem_len
+            rotary_pos_emb = self.rotary_pos_emb(pos)
 
         # assume cached key / values
 
@@ -1292,7 +1322,9 @@ class AttentionLayers(nn.Module):
             if layer_type == 'a':
                 if return_hiddens:
                     hiddens.append(x)
+
                 layer_mem = mems.pop(0) if mems else None
+                layer_mem_mask = mem_masks.pop(0) if mem_masks else None
 
             if layer_type == 'c':
                 if self.training and self.cross_attn_tokens_dropout > 0.:
@@ -1308,7 +1340,11 @@ class AttentionLayers(nn.Module):
             if exists(pre_norm):
                 x = pre_norm(x)
 
+                if layer_type == 'a' and exists(layer_mem):
+                    layer_mem = pre_norm(layer_mem)
+
             if layer_type == 'a':
+                out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, cache = next(iter_attn_cache, None), mem = layer_mem, mem_mask = layer_mem_mask, return_intermediates = True)
                 # print("self-attention")
                 out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, cache = next(iter_attn_cache, None), mem = layer_mem, return_intermediates = True)
             elif layer_type == 'c':
@@ -1431,12 +1467,12 @@ class ViTransformerWrapper(nn.Module):
             self.register_tokens = nn.Parameter(torch.randn(num_register_tokens, dim))
 
         self.patch_to_embedding = nn.Sequential(
-            nn.LayerNorm(patch_dim),
+            LayerNorm(patch_dim),
             nn.Linear(patch_dim, dim),
-            nn.LayerNorm(dim)
+            LayerNorm(dim)
         )
 
-        self.post_emb_norm = nn.LayerNorm(dim) if post_emb_norm else nn.Identity()
+        self.post_emb_norm = LayerNorm(dim) if post_emb_norm else nn.Identity()
         self.dropout = nn.Dropout(emb_dropout)
 
         self.attn_layers = attn_layers
@@ -1446,7 +1482,8 @@ class ViTransformerWrapper(nn.Module):
     def forward(
         self,
         img,
-        return_embeddings = False
+        return_embeddings = False,
+        return_logits_and_embeddings = False
     ):
         b, p = img.shape[0], self.patch_size
 
@@ -1463,16 +1500,23 @@ class ViTransformerWrapper(nn.Module):
             r = repeat(self.register_tokens, 'n d -> b n d', b = b)
             x, ps = pack((x, r), 'b * d')
 
-        x = self.attn_layers(x)
+        embed = self.attn_layers(x)
 
         if self.has_register_tokens:
-            x, _ = unpack(x, ps, 'b * d')
+            embed, _ = unpack(embed, ps, 'b * d')
+
+        assert at_most_one_of(return_embeddings, return_logits_and_embeddings)
 
         if not exists(self.mlp_head) or return_embeddings:
-            return x
+            return embed
 
-        x = x.mean(dim = -2)
-        return self.mlp_head(x)
+        pooled = embed.mean(dim = -2)
+        logits = self.mlp_head(pooled)
+
+        if not return_logits_and_embeddings:
+            return logits
+
+        return logits, embed
 
 class TransformerWrapper(nn.Module):
     def __init__(
@@ -1511,7 +1555,9 @@ class TransformerWrapper(nn.Module):
         self.l2norm_embed = l2norm_embed
         self.token_emb = TokenEmbedding(emb_dim, num_tokens, l2norm_embed = l2norm_embed)
 
-        if max_seq_len == 0 or not (use_abs_pos_emb and not attn_layers.has_pos_emb):
+        no_abs_pos_emb = max_seq_len == 0 or not (use_abs_pos_emb and not attn_layers.disable_abs_pos_emb)
+
+        if no_abs_pos_emb:
             self.pos_emb = always(0)
         elif scaled_sinu_pos_emb:
             self.pos_emb = ScaledSinusoidalEmbedding(emb_dim)
@@ -1529,7 +1575,7 @@ class TransformerWrapper(nn.Module):
 
         self.emb_frac_gradient = emb_frac_gradient
 
-        self.post_emb_norm = nn.LayerNorm(emb_dim) if post_emb_norm else nn.Identity()
+        self.post_emb_norm = LayerNorm(emb_dim) if post_emb_norm else nn.Identity()
         self.emb_dropout = nn.Dropout(emb_dropout)
 
         self.project_emb = nn.Linear(emb_dim, dim) if emb_dim != dim else nn.Identity()
@@ -1538,7 +1584,7 @@ class TransformerWrapper(nn.Module):
         self.init_()
 
         logits_dim = default(logits_dim, num_tokens)
-        self.to_logits = nn.Linear(dim, logits_dim) if not tie_embedding else lambda t: t @ self.token_emb.emb.weight.t()
+        self.to_logits = nn.Linear(dim, logits_dim, bias = False) if not tie_embedding else lambda t: t @ self.token_emb.emb.weight.t()
 
         # memory tokens (like [cls]) from Memory Transformers paper
 
@@ -1552,6 +1598,7 @@ class TransformerWrapper(nn.Module):
         # whether can do cached kv decoding
 
         self.can_cache_kv = self.num_memory_tokens == 0
+        self.can_cache_kv_outside_max_seq_len = no_abs_pos_emb
 
     def init_(self):
         if self.l2norm_embed:
@@ -1572,6 +1619,7 @@ class TransformerWrapper(nn.Module):
         return_mems = False,
         return_attn = False,
         mems = None,
+        mem_masks = None,
         pos = None,
         prepend_embeds = None,
         prepend_mask = None,
@@ -1665,7 +1713,7 @@ class TransformerWrapper(nn.Module):
             mems_l, mems_r = mems[:self.shift_mem_down], mems[self.shift_mem_down:]
             mems = [*mems_r, *mems_l]
 
-        x, intermediates = self.attn_layers(x, mask = mask, mems = mems, cache = cache, return_hiddens = True, seq_start_pos = seq_start_pos, **kwargs)
+        x, intermediates = self.attn_layers(x, mask = mask, mems = mems, mem_masks = mem_masks, cache = cache, return_hiddens = True, seq_start_pos = seq_start_pos, **kwargs)
 
         if has_memory_tokens:
             if exists(mem_every):

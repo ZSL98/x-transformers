@@ -1171,6 +1171,8 @@ This flavor of attention also has <a href="https://arxiv.org/abs/2111.05498">a c
 
 Update: I have discovered a way to remove the learned temperature altogether, by grouping the feature dimension and doing l2-normalization on each group. This allows the queries and keys to have a similarity that is upper bounded by the number of groups. A group size of 8 or 16 was sufficient in my tests. Decided to name this technique "Grouped QK Normalization". The drawback is that I believe an attention head dimension 32 is too small to use this tactic (a dimension often used in vision)
 
+Update 2: Tero Karras has successfully used cosine sim attention in <a href="https://arxiv.org/abs/2312.02696">a new paper</a>.
+
 You can use it as follows
 
 ```python
@@ -2071,6 +2073,17 @@ ids_out, num_out, is_number_mask = model.generate(start_ids, start_nums, 17)
     author  = {Siavash Golkar and Mariel Pettee and Michael Eickenberg and Alberto Bietti and M. Cranmer and G{\'e}raud Krawezik and Francois Lanusse and Michael McCabe and Ruben Ohana and Liam Parker and Bruno R{\'e}galdo-Saint Blancard and Tiberiu Teşileanu and Kyunghyun Cho and Shirley Ho},
     year    = {2023},
     url     = {https://api.semanticscholar.org/CorpusID:263622222}
+}
+```
+
+```bibtex
+@article{Rafailov2023DirectPO,
+    title   = {Direct Preference Optimization: Your Language Model is Secretly a Reward Model},
+    author  = {Rafael Rafailov and Archit Sharma and Eric Mitchell and Stefano Ermon and Christopher D. Manning and Chelsea Finn},
+    journal = {ArXiv},
+    year    = {2023},
+    volume  = {abs/2305.18290},
+    url     = {https://api.semanticscholar.org/CorpusID:258959321}
 }
 ```
 
