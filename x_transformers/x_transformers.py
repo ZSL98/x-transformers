@@ -803,6 +803,7 @@ class Attention(nn.Module):
         b, n, h, kv_h, head_scale, device, has_context = x.shape[0], x.shape[1], self.heads, self.kv_heads, self.head_scale, x.device, exists(context)
 
         kv_input = default(context, x)
+        # print("kv_input: ", kv_input.shape)
 
         q_input = x
         k_input = kv_input
@@ -813,6 +814,7 @@ class Attention(nn.Module):
             k_input, mem_packed_shape = pack([mem, k_input], 'b * d')
             v_input, _ = pack([mem, v_input], 'b * d')
 
+        # print('q_input: ', q_input.shape)
         q = self.to_q(q_input)
         k = self.to_k(k_input)
         v = self.to_v(v_input) if exists(self.to_v) else k
@@ -823,9 +825,11 @@ class Attention(nn.Module):
         k, v, r = map(lambda t: maybe(rearrange)(t, 'b n (h d) -> b h n d', h = kv_h), (k, v, r))
 
         if exists(cache) and not has_context:
+            # print("Yes, has cache: ", cache.cached_kv[0][0][0][0][0])
             ck, cv = cache.cached_kv
 
             if exists(mem):
+                # print("Yes, has mem")
                 mk, k = unpack(k, mem_packed_shape, 'b h * d')
                 mv, v = unpack(v, mem_packed_shape, 'b h * d')
 
@@ -859,6 +863,7 @@ class Attention(nn.Module):
                 v = apply_rotary_pos_emb(v, freqs, k_xpos_scale)
 
         input_mask = context_mask
+        # print('input_mask: ', input_mask)
 
         if not exists(input_mask) and not has_context:
             input_mask = mask
@@ -888,10 +893,12 @@ class Attention(nn.Module):
         final_attn_mask = None
 
         if exists(input_mask):
+            # print('input_mask')
             input_mask = rearrange(input_mask, 'b j -> b 1 1 j')
             masks.append(~input_mask)
 
         if exists(attn_mask):
+            # print('attn_mask')
             assert 2 <= attn_mask.ndim <= 4, 'attention mask must have greater than 2 dimensions but less than or equal to 4'
             if attn_mask.ndim == 2:
                 attn_mask = rearrange(attn_mask, 'i j -> 1 1 i j')
@@ -906,6 +913,7 @@ class Attention(nn.Module):
             max_attend_past_mask = dist > self.max_attend_past
             masks.append(max_attend_past_mask)
 
+        # print('len(masks): ', len(masks))
         if len(masks) > 0:
             final_attn_mask = ~or_reduce(masks)
 
@@ -916,7 +924,9 @@ class Attention(nn.Module):
             attn_bias = rel_pos(i, j)
 
         # attention is all we need
-
+        # print("q_after: ", q.shape)
+        # print("k_after: ", k.shape)
+        # print("v_after: ", v.shape)
         out, intermediates = self.attend(
             q, k, v,
             mask = final_attn_mask,
@@ -1213,7 +1223,6 @@ class AttentionLayers(nn.Module):
         assert not (self.cross_attend ^ exists(context)), 'context must be passed in if cross_attend is set to True'
 
         # initialize accums
-
         hiddens = []
         layer_hiddens = []
         intermediates = []
@@ -1234,6 +1243,8 @@ class AttentionLayers(nn.Module):
             else:
                 self_attn_kv_mask = left_pad_mask
 
+        # print("self_attn_kv_mask: ", self_attn_kv_mask)
+
         # rotary positions
 
         if not exists(rotary_pos_emb) and exists(self.rotary_pos_emb):
@@ -1251,6 +1262,7 @@ class AttentionLayers(nn.Module):
                 x = x[:, -cache_age:] # for spec decoding, may be greater than 1
 
             attn_cache = cache.attn_intermediates
+            # print("attn_cache shape:", attn_cache[1].cached_kv[1].shape)
 
         iter_attn_cache = iter(attn_cache)
 
@@ -1271,6 +1283,7 @@ class AttentionLayers(nn.Module):
         # go through the attention and feedforward layers
 
         for ind, (layer_type, (norm, block, residual_fn), layer_dropout) in enumerate(zip(*layer_variables)):
+            # print(layer_type)
             is_last = ind == (len(self.layers) - 1)
 
             if self.training and layer_dropout > 0. and random() < layer_dropout:
@@ -1296,10 +1309,13 @@ class AttentionLayers(nn.Module):
                 x = pre_norm(x)
 
             if layer_type == 'a':
+                # print("self-attention")
                 out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, cache = next(iter_attn_cache, None), mem = layer_mem, return_intermediates = True)
             elif layer_type == 'c':
+                # print("cross-attention")
                 out, inter = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn, cache = next(iter_attn_cache, None), return_intermediates = True)
             elif layer_type == 'f':
+                # print("f: ", block)
                 out = block(x)
 
             if self.resi_dual:
