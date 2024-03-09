@@ -187,9 +187,9 @@ class AutoregressiveWrapper(Module):
         # sampling up to seq_len
         # print('seq_len: ', seq_len)
         #TODO: Check the right version
-        # for _ in range(seq_len):
-        for _ in range(3):
-            print("exist cache: ", exists(cache))
+        for _ in range(seq_len):
+        # for _ in range(3):
+            # print("exist cache: ", exists(cache))
             if restrict_to_max_seq_len:
                 max_len_exceeded = out.shape[-1] > max_seq_len
 
@@ -201,7 +201,7 @@ class AutoregressiveWrapper(Module):
                     for inter in cache.attn_intermediates:
                         inter.cached_kv = [t[..., -(max_seq_len - 1):, :] for t in inter.cached_kv]
 
-            print('x.shape: ', x.shape)
+            # print('x.shape: ', x.shape)
             logits, new_cache = self.net(
                 x,
                 return_intermediates = True,
@@ -250,8 +250,10 @@ class AutoregressiveWrapper(Module):
 
             out = torch.cat((out, sample), dim=-1)
 
-            if exists(eos_token):
-                is_eos_tokens = (out == eos_token)
+            if not exists(eos_token):
+                continue
+
+            is_eos_tokens = (out == eos_token)
 
             if is_eos_tokens.any(dim = -1).all():
                 break
@@ -284,6 +286,7 @@ class AutoregressiveWrapper(Module):
             alpha = 0.1
         ),
         cache_kv = True,
+        kv_cache = None,
         **kwargs
     ):
         max_seq_len, device = self.max_seq_len, prompts.device
@@ -299,76 +302,30 @@ class AutoregressiveWrapper(Module):
         out = prompts
 
         # kv caches
-        cache = None
-        # if doing contrastive decoding, turn off filter automatically
-        if exists(amateur_model):
-            amateur_model = cast_tuple(amateur_model)
-            contrastive_decode_kwargs = cast_tuple(contrastive_decode_kwargs)
-
-            assert len(amateur_model) == len(contrastive_decode_kwargs)
-
-            amateur_caches = [None] * len(amateur_model)
-            filter_logits_fn = identity
-
-            for i, module in enumerate(amateur_model):
-                if isinstance(module, AutoregressiveWrapper):
-                    amateur_model[i] = module.net
-
-                module.eval()
+        cache = kv_cache
 
         # sampling up to seq_len
-        for _ in range(1):
-            if restrict_to_max_seq_len:
-                # print("max_seq_len: ", max_seq_len)
-                # print("out shape: ", out.shape)
-                x = out[:, -max_seq_len:]
+        if restrict_to_max_seq_len:
+            x = out[:, -max_seq_len:]
 
-                if exists(cache):
-                    for inter in cache.attn_intermediates:
-                        inter.cached_kv = [t[..., -(max_seq_len - 1):, :] for t in inter.cached_kv]
+        logits, new_cache = self.net(
+            x,
+            return_intermediates = True,
+            cache = cache,
+            seq_start_pos = seq_start_pos,
+            **kwargs
+        )
 
-            logits, new_cache = self.net(
-                x,
-                return_intermediates = True,
-                cache = cache,
-                seq_start_pos = seq_start_pos,
-                **kwargs
-            )
+        logits = logits[:, -1]
 
-            if cache_kv and self.net.can_cache_kv:
-                cache = new_cache
-
-            logits = logits[:, -1]
-
-            # handle contrastive decoding, Li et al.
-            # https://arxiv.org/abs/2210.15097
-
-            if exists(amateur_model):
-                for i, (amateur, amateur_cache, amateur_contrastive_decode_kwargs) in enumerate(zip(amateur_model, amateur_caches, contrastive_decode_kwargs)):
-                    amateur_logits, next_amateur_cache = amateur(
-                        x,
-                        return_intermediates = True,
-                        cache = amateur_cache,
-                        seq_start_pos = seq_start_pos,
-                        **kwargs
-                    )
-
-                    amateur_logits = amateur_logits[:, -1]
-
-                    assert amateur_logits.shape == logits.shape, 'logits dimension are not the same between amateur and expert model'
-                    logits = contrastive_decode_fn(logits, amateur_logits, **amateur_contrastive_decode_kwargs)
-
-                    if cache_kv and amateur.can_cache_kv:
-                        amateur_caches[i] = next_amateur_cache
-
-            # filter by top_k, top_p (nucleus), top_a, or custom
-            filtered_logits = filter_logits_fn(logits, **filter_kwargs)
-            probs = F.softmax(filtered_logits / temperature, dim=-1)
+        # filter by top_k, top_p (nucleus), top_a, or custom
+        filtered_logits = filter_logits_fn(logits, **filter_kwargs)
+        probs = F.softmax(filtered_logits / temperature, dim=-1)
 
         out = out[:, t:]
         out, = unpack(out, ps, '* n')
 
-        return out
+        return out, new_cache
 
     def forward(self, x, return_outputs = False, **kwargs):
         seq, ignore_index, add_attn_z_loss = x.shape[1], self.ignore_index, self.add_attn_z_loss
