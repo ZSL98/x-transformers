@@ -695,7 +695,8 @@ class Attention(nn.Module):
         tensor_product = False,      # https://arxiv.org/abs/2208.06061
         add_zero_kv = False,         # same as add_zero_attn in pytorch
         rotary_embed_values = False,
-        onnxable = False
+        onnxable = False,
+        op_type = 0,
     ):
         super().__init__()
         dim_kv = default(dim_context, dim)
@@ -763,7 +764,7 @@ class Attention(nn.Module):
         assert not (qk_norm and (dim_head // qk_norm_groups) <= 2), 'the group dimension may be too small (2 was too small in my tests, but 4 still works, surprisingly)'
 
         # attend class - includes core attention algorithm + talking heads
-
+        # print("flash: ", flash)
         self.attend = Attend(
             heads = heads,
             causal = causal,
@@ -774,7 +775,8 @@ class Attention(nn.Module):
             scale = qk_norm_scale if qk_norm else self.scale,
             add_zero_kv = add_zero_kv,
             flash = flash,
-            onnxable = onnxable
+            onnxable = onnxable,
+            op_type = op_type
         )
 
         # head scaling
@@ -815,12 +817,13 @@ class Attention(nn.Module):
         mem = None,
         mem_mask = None,
         return_intermediates = False,
-        cache: Optional[Intermediates] = None,
+        cache = None,
+        pass_redundant_compute = False,
     ):
         b, n, h, kv_h, head_scale, device, has_context = x.shape[0], x.shape[1], self.heads, self.kv_heads, self.head_scale, x.device, exists(context)
 
         kv_input = default(context, x)
-        # print("kv_input: ", kv_input.shape)
+        # print("x shape: ", x.shape)
 
         q_input = x
         k_input = kv_input
@@ -831,7 +834,7 @@ class Attention(nn.Module):
             k_input, mem_packed_shape = pack([mem, k_input], 'b * d')
             v_input, _ = pack([mem, v_input], 'b * d')
 
-        # print('q_input: ', q_input.shape)
+        # print('k_input: ', k_input.shape, k_input.dtype)
         q = self.to_q(q_input)
         k = self.to_k(k_input)
         v = self.to_v(v_input) if exists(self.to_v) else k
@@ -841,9 +844,16 @@ class Attention(nn.Module):
 
         k, v, r = map(lambda t: maybe(rearrange)(t, 'b n (h d) -> b h n d', h = kv_h), (k, v, r))
 
+        # if has_context:
+            # print("cross-attention")
         if exists(cache) and not has_context:
-            # print("Yes, has cache: ", cache.cached_kv[0][0][0][0][0])
-            ck, cv = cache.cached_kv
+            # print("self-attention")
+            if isinstance(cache, list):
+                ck, cv = cache
+                # ck = ck[:,:,:-1,:]
+                # cv = cv[:,:,:-1,:]
+            else:
+                ck, cv = cache.cached_kv
 
             if exists(mem):
                 # print("Yes, has mem")
@@ -856,6 +866,20 @@ class Attention(nn.Module):
             if exists(mem):
                 k = torch.cat((mk, k), dim = -2)
                 v = torch.cat((mv, v), dim = -2)
+
+        if pass_redundant_compute:
+            # print("Overmit redundant computation.")
+            # print("q shape: ", q.shape)
+            # print("k shape: ", k.shape)
+            # print("v shape: ", v.shape)
+            # print("=================")
+            out, intermediates = self.attend(
+                q, k, v,
+                mask = None,
+                attn_bias = None,
+                prev_attn = None
+            )
+            return out, intermediates
 
         if return_intermediates:
             mem_len = mem.shape[-2] if exists(mem) else 0
@@ -975,7 +999,6 @@ class Attention(nn.Module):
             out = out * rearrange(head_gate, 'b n h -> b h n 1').sigmoid()
 
         # merge heads
-
         out = rearrange(out, 'b h n d -> b n (h d)')
 
         # alphafold2 styled gating of the values
@@ -1047,6 +1070,7 @@ class AttentionLayers(nn.Module):
         layer_dropout = 0.,
         cross_attn_tokens_dropout = 0.,
         disable_abs_pos_emb = None,
+        dim_head = 64,
         **kwargs
     ):
         super().__init__()
@@ -1056,8 +1080,9 @@ class AttentionLayers(nn.Module):
         attn_kwargs, kwargs = groupby_prefix_and_trim('attn_', kwargs)
         cross_attn_kwargs, kwargs = groupby_prefix_and_trim('cross_attn_', kwargs)
 
-        dim_head = attn_kwargs.get('dim_head', DEFAULT_DIM_HEAD)
-
+        # dim_head = attn_kwargs.get('dim_head', DEFAULT_DIM_HEAD)
+        # print('dim_head: ', dim_head)
+        self.dim_head = dim_head
         self.dim = dim
         self.depth = depth
         self.causal = causal
@@ -1076,6 +1101,7 @@ class AttentionLayers(nn.Module):
         # relative positional bias
 
         flash_attn = attn_kwargs.get('flash', False)
+        # print("flash_attn: ", flash_attn)
         assert (int(rel_pos_bias) + int(dynamic_pos_bias) + int(alibi_pos_bias)) <= 1, 'you can only choose up to one of t5, alibi, or dynamic positional bias'
 
         self.rel_pos = None
@@ -1192,14 +1218,14 @@ class AttentionLayers(nn.Module):
         self.final_norm = norm_fn() if pre_norm or resi_dual else nn.Identity()
 
         # iterate and construct layers
-
+        # print(self.layer_types)
         for ind, (layer_type, layer_shift_tokens) in enumerate(zip(self.layer_types, shift_tokens)):
             is_last_layer = ind == (len(self.layer_types) - 1)
 
             if layer_type == 'a':
-                layer = Attention(dim, heads = heads, causal = causal, **attn_kwargs)
+                layer = Attention(dim, heads = heads, causal = causal, flash=True, op_type=0, dim_head=dim_head, **attn_kwargs)
             elif layer_type == 'c':
-                layer = Attention(dim, heads = heads, **{**attn_kwargs, **cross_attn_kwargs})
+                layer = Attention(dim, heads = heads, flash=True, op_type=0, dim_head=dim_head, **{**attn_kwargs, **cross_attn_kwargs})
             elif layer_type == 'f':
                 layer = FeedForward(dim, **ff_kwargs)
                 layer = layer if not macaron else Scale(0.5, layer)
@@ -1237,64 +1263,66 @@ class AttentionLayers(nn.Module):
         mask = None,
         context_mask = None,
         attn_mask = None,
-        self_attn_kv_mask = None,
+        self_attn_kv_mask = None,   
         mems = None,
         mem_masks = None,
         seq_start_pos: Optional[Tensor] = None,
         cache: Optional[LayerIntermediates] = None,
         cache_age = 1,
         return_hiddens = False,
-        rotary_pos_emb = None
+        rotary_pos_emb = None,
+        supercache = None,
+        pass_redundant_compute = False,
     ):
         assert not (self.cross_attend ^ exists(context)), 'context must be passed in if cross_attend is set to True'
-
-        # initialize accums
-        hiddens = []
-        layer_hiddens = []
-        intermediates = []
-
         prev_attn = None
         prev_cross_attn = None
 
-        mems = mems.copy() if exists(mems) else [None] * self.num_attn_layers
-        mem_masks = mem_masks.copy() if exists(mem_masks) else [None] * self.num_attn_layers
+        if not pass_redundant_compute:
+            # initialize accums
+            hiddens = []
+            layer_hiddens = []
+            intermediates = []
 
-        # handle left padded sequences
+            mems = mems.copy() if exists(mems) else [None] * self.num_attn_layers
+            mem_masks = mem_masks.copy() if exists(mem_masks) else [None] * self.num_attn_layers
 
-        if exists(seq_start_pos):
-            seq_arange = torch.arange(x.shape[-2], device = x.device, dtype = torch.long)
-            left_pad_mask = seq_arange >= seq_start_pos[..., None]
+            # handle left padded sequences
 
-            if exists(self_attn_kv_mask):
-                self_attn_kv_mask = self_attn_kv_mask & left_pad_mask
-            else:
-                self_attn_kv_mask = left_pad_mask
+            if exists(seq_start_pos):
+                seq_arange = torch.arange(x.shape[-2], device = x.device, dtype = torch.long)
+                left_pad_mask = seq_arange >= seq_start_pos[..., None]
 
-        # print("self_attn_kv_mask: ", self_attn_kv_mask)
+                if exists(self_attn_kv_mask):
+                    self_attn_kv_mask = self_attn_kv_mask & left_pad_mask
+                else:
+                    self_attn_kv_mask = left_pad_mask
 
-        # rotary positions
+            # print("self_attn_kv_mask: ", self_attn_kv_mask)
 
-        if not exists(rotary_pos_emb) and exists(self.rotary_pos_emb):
-            maybe_mem = mems[0] # todo - handle edge case where different layers get different memory lengths. don't think this will ever come up but who knows
-            mem_len = maybe_mem.shape[1] if exists(maybe_mem) else 0
+            # rotary positions
 
-            pos = torch.arange(x.shape[1] + mem_len, device = x.device) - mem_len
-            rotary_pos_emb = self.rotary_pos_emb(pos)
+            if not exists(rotary_pos_emb) and exists(self.rotary_pos_emb):
+                maybe_mem = mems[0] # todo - handle edge case where different layers get different memory lengths. don't think this will ever come up but who knows
+                mem_len = maybe_mem.shape[1] if exists(maybe_mem) else 0
 
-        # assume cached key / values
+                pos = torch.arange(x.shape[1] + mem_len, device = x.device) - mem_len
+                rotary_pos_emb = self.rotary_pos_emb(pos)
 
-        attn_cache = []
+            # assume cached key / values
 
-        if exists(cache):
-            # assert not self.training and self.causal and not any([*map(exists, (mask, attn_mask))])
+            attn_cache = []
 
-            if cache_age > 0:
-                x = x[:, -cache_age:] # for spec decoding, may be greater than 1
+            if exists(cache):
+                # assert not self.training and self.causal and not any([*map(exists, (mask, attn_mask))])
 
-            attn_cache = cache.attn_intermediates
-            # print("attn_cache shape:", attn_cache[1].cached_kv[1].shape)
+                if cache_age > 0:
+                    x = x[:, -cache_age:] # for spec decoding, may be greater than 1
 
-        iter_attn_cache = iter(attn_cache)
+                attn_cache = cache.attn_intermediates
+                # print("attn_cache shape:", attn_cache[1].cached_kv[1].shape)
+
+            iter_attn_cache = iter(attn_cache)
 
         # outer residual - for resiDual paper
 
@@ -1310,8 +1338,18 @@ class AttentionLayers(nn.Module):
 
         layer_variables = tuple(tuple(layer_variable[i] for i in self.layers_execute_order) for layer_variable in layer_variables)
 
-        # go through the attention and feedforward layers
+        if pass_redundant_compute:
+            for ind, (layer_type, (norm, block, residual_fn), layer_dropout) in enumerate(zip(*layer_variables)):
+                if layer_type == 'a':
+                    out = block(x, cache = supercache, pass_redundant_compute=True)
+                elif layer_type == 'c':
+                    out = block(x, context = context, pass_redundant_compute=True)
+                elif layer_type == 'f':
+                    out = block(x)
 
+            return out, None
+
+        # go through the attention and feedforward layers
         for ind, (layer_type, (norm, block, residual_fn), layer_dropout) in enumerate(zip(*layer_variables)):
             # print(layer_type)
             is_last = ind == (len(self.layers) - 1)
@@ -1344,14 +1382,19 @@ class AttentionLayers(nn.Module):
                     layer_mem = pre_norm(layer_mem)
 
             if layer_type == 'a':
-                out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, cache = next(iter_attn_cache, None), mem = layer_mem, mem_mask = layer_mem_mask, return_intermediates = True)
+                if exists(supercache):
+                    _cache = supercache
+                else:
+                    _cache = next(iter_attn_cache, None)
+                out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, cache = _cache, mem = layer_mem, mem_mask = layer_mem_mask, return_intermediates = True)
                 # print("self-attention")
-                out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, cache = next(iter_attn_cache, None), mem = layer_mem, return_intermediates = True)
+                # print("out shape: ", out.shape)
+                # print("inter shape: ", inter.shape)
             elif layer_type == 'c':
                 # print("cross-attention")
                 out, inter = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn, cache = next(iter_attn_cache, None), return_intermediates = True)
             elif layer_type == 'f':
-                # print("f: ", block)
+                # print("ffn")
                 out = block(x)
 
             if self.resi_dual:
@@ -1392,6 +1435,13 @@ class AttentionLayers(nn.Module):
         )
 
         return x, intermediates
+
+    def prefill(self, x, cache, context):
+        return self.forward(x, context = context, supercache = None, pass_redundant_compute=True)
+    
+    def decode(self, x, cache, context):
+        return self.forward(x, context = context, supercache = cache, pass_redundant_compute=True)
+
 
 class Encoder(AttentionLayers):
     def __init__(self, **kwargs):

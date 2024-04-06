@@ -12,6 +12,11 @@ from dataclasses import dataclass
 
 from einops import rearrange, repeat
 
+import xformers
+import xformers.ops
+
+import flashinfer
+
 # constants
 
 @dataclass
@@ -80,10 +85,12 @@ class Attend(nn.Module):
             enable_flash = True,
             enable_math = True,
             enable_mem_efficient = True
-        )
+        ),
+        op_type = 0,
     ):
         super().__init__()
         self.scale = scale
+        self.op_type = op_type
 
         self.causal = causal
         self.create_causal_mask = onnx_create_causal_mask if onnxable else create_causal_mask
@@ -129,7 +136,6 @@ class Attend(nn.Module):
 
         # Recommended for multi-query single-key-value attention by Tri Dao
         # kv shape torch.Size([1, 512, 64]) -> torch.Size([1, 8, 512, 64])
-
         if k.ndim == 3:
             k = repeat(k, 'b ... -> b h ...', h = q.shape[1])
 
@@ -240,7 +246,6 @@ class Attend(nn.Module):
         """
 
         n, heads, kv_heads, device = q.shape[-2], q.shape[1], k.shape[1], q.device
-
         scale = default(self.scale, q.shape[-1] ** -0.5)
 
         causal = self.causal
@@ -270,7 +275,33 @@ class Attend(nn.Module):
 
         if self.flash:
             assert not exists(prev_attn), 'residual attention not compatible with flash attention'
-            return self.flash_attn(q, k, v, mask = mask, attn_bias = attn_bias)
+            if self.op_type == 0:
+                # print("q shape: ", q.shape)
+                # print("k shape: ", k.shape)
+                # print("v shape: ", v.shape)
+                # op0 refers to the pytorch flash attention
+                return self.flash_attn(q, k, v, mask = mask, attn_bias = attn_bias)
+            
+            elif self.op_type == 1:
+                # op1 refers to the xformers flash attention2
+                q, k, v = map(lambda t: rearrange(t, 'b h m k -> b m h k'), (q, k, v))
+                out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias, op=xformers.ops.MemoryEfficientAttentionFlashAttentionOp)
+                out = rearrange(out, 'b m h k -> b h m k')
+                return out, Intermediates()
+            
+            elif self.op_type == 2:
+                # op2 refers to flashinfer batch decode
+                if q.shape[2] != 1:
+                    # WARNING!!!! seq_len has to be 1, otherwise, switch to op0
+                    return self.flash_attn(q, k, v, mask = mask, attn_bias = attn_bias)
+                q = rearrange(q, 'b h 1 k -> b h k')
+                # k, v = map(lambda t: rearrange(t, 'b h m k -> b m h k'), (k, v))
+                # FIXME: What is the contiguous overhead here?
+                k = k.contiguous()
+                v = v.contiguous()
+                out = flashinfer.batch_decode_with_padded_kv_cache(q, k, v, "HND")
+                out = rearrange(out, 'b h k -> b h 1 k')
+                return out, Intermediates()
 
         kv_einsum_eq = 'b j d' if k.ndim == 3 else 'b h j d'
 

@@ -287,6 +287,7 @@ class AutoregressiveWrapper(Module):
         ),
         cache_kv = True,
         kv_cache = None,
+        supercache = None,
         **kwargs
     ):
         max_seq_len, device = self.max_seq_len, prompts.device
@@ -308,13 +309,18 @@ class AutoregressiveWrapper(Module):
         if restrict_to_max_seq_len:
             x = out[:, -max_seq_len:]
 
+        # alloc = torch.cuda.memory_allocated()
+        # print('-------1: ', alloc/(1024*1024))
         logits, new_cache = self.net(
             x,
             return_intermediates = True,
             cache = cache,
             seq_start_pos = seq_start_pos,
+            supercache = supercache,
             **kwargs
         )
+        # alloc = torch.cuda.memory_allocated()
+        # print('-------2: ', alloc/(1024*1024))
 
         logits = logits[:, -1]
 
