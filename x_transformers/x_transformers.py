@@ -883,7 +883,8 @@ class Attention(nn.Module):
 
         if return_intermediates:
             mem_len = mem.shape[-2] if exists(mem) else 0
-            cached_kv = (k[..., mem_len:, :], v[..., mem_len:, :])
+            # cached_kv = (k[..., mem_len:, :], v[..., mem_len:, :])
+            cached_kv = (k[..., -1:, :], v[..., -1:, :])
 
         if self.qk_norm:
             qk_l2norm = partial(l2norm, groups = self.qk_norm_groups)
@@ -1273,6 +1274,8 @@ class AttentionLayers(nn.Module):
         rotary_pos_emb = None,
         supercache = None,
         pass_redundant_compute = False,
+        slice_num = 1,
+        slice_id = 0,
     ):
         assert not (self.cross_attend ^ exists(context)), 'context must be passed in if cross_attend is set to True'
         prev_attn = None
@@ -1351,6 +1354,8 @@ class AttentionLayers(nn.Module):
 
         # go through the attention and feedforward layers
         for ind, (layer_type, (norm, block, residual_fn), layer_dropout) in enumerate(zip(*layer_variables)):
+            if ind < len(self.layers)/slice_num * slice_id or ind >= len(self.layers)/slice_num * (slice_id + 1):
+                continue
             # print(layer_type)
             is_last = ind == (len(self.layers) - 1)
 
@@ -1389,7 +1394,7 @@ class AttentionLayers(nn.Module):
                 out, inter = block(x, mask = mask, context_mask = self_attn_kv_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, cache = _cache, mem = layer_mem, mem_mask = layer_mem_mask, return_intermediates = True)
                 # print("self-attention")
                 # print("out shape: ", out.shape)
-                # print("inter shape: ", inter.shape)
+                # print("inter shape: ", inter.cached_kv[0].shape)
             elif layer_type == 'c':
                 # print("cross-attention")
                 out, inter = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn, cache = next(iter_attn_cache, None), return_intermediates = True)
@@ -1533,7 +1538,9 @@ class ViTransformerWrapper(nn.Module):
         self,
         img,
         return_embeddings = False,
-        return_logits_and_embeddings = False
+        return_logits_and_embeddings = False,
+        slice_num = 1,
+        slice_id = 0,
     ):
         b, p = img.shape[0], self.patch_size
 
@@ -1550,7 +1557,7 @@ class ViTransformerWrapper(nn.Module):
             r = repeat(self.register_tokens, 'n d -> b n d', b = b)
             x, ps = pack((x, r), 'b * d')
 
-        embed = self.attn_layers(x)
+        embed = self.attn_layers(x, slice_num=slice_num, slice_id=slice_id)
 
         if self.has_register_tokens:
             embed, _ = unpack(embed, ps, 'b * d')
@@ -1679,135 +1686,145 @@ class TransformerWrapper(nn.Module):
         attn_z_loss_weight = 1e-4,
         seq_start_pos = None,
         cache: Optional[LayerIntermediates] = None,
+        enable_slice = False,
+        slice_num = 1,
+        slice_id = 0,
+        pre_compute = True,
+        post_compute = True,
         **kwargs
     ):
-        b, n, device, num_mems, has_memory_tokens, emb_frac_gradient = x.shape[0], x.shape[1], x.device, self.num_memory_tokens, self.num_memory_tokens > 0, self.emb_frac_gradient
-        return_hiddens = return_mems | return_attn | return_intermediates | return_attn_z_loss
+        if pre_compute:
+            b, n, device, num_mems, has_memory_tokens, emb_frac_gradient = x.shape[0], x.shape[1], x.device, self.num_memory_tokens, self.num_memory_tokens > 0, self.emb_frac_gradient
+            return_hiddens = return_mems | return_attn | return_intermediates | return_attn_z_loss
 
-        # absolute positional embedding
+            # absolute positional embedding
 
-        external_pos_emb = exists(pos) and pos.dtype != torch.long
-        pos_emb = self.pos_emb(x, pos = pos, seq_start_pos = seq_start_pos) if not external_pos_emb else pos
-        x = self.token_emb(x) + pos_emb
+            external_pos_emb = exists(pos) and pos.dtype != torch.long
+            pos_emb = self.pos_emb(x, pos = pos, seq_start_pos = seq_start_pos) if not external_pos_emb else pos
+            x = self.token_emb(x) + pos_emb
 
-        # add additional embeddings
+            # add additional embeddings
 
-        if exists(self.embeds):
-            assert len(embed_ids) == len(self.embeds)
+            if exists(self.embeds):
+                assert len(embed_ids) == len(self.embeds)
 
-            for name, embed_id in embed_ids.items():
-                embed_key = f'{name}_embed'
+                for name, embed_id in embed_ids.items():
+                    embed_key = f'{name}_embed'
 
-                assert embed_key in self.embeds
-                embed = self.embeds[embed_key](embed_id)
+                    assert embed_key in self.embeds
+                    embed = self.embeds[embed_key](embed_id)
 
-                x = x + embed
+                    x = x + embed
 
-        # for summing embeddings passed externally - needs this for self-conditioning in non-autoregressive training
+            # for summing embeddings passed externally - needs this for self-conditioning in non-autoregressive training
 
-        if exists(sum_embeds):
-            x = x + sum_embeds
+            if exists(sum_embeds):
+                x = x + sum_embeds
 
-        # post embedding norm, purportedly leads to greater stabilization
+            # post embedding norm, purportedly leads to greater stabilization
 
-        x = self.post_emb_norm(x)
+            x = self.post_emb_norm(x)
 
-        # whether to append embeds, as in PaLI, for image embeddings
+            # whether to append embeds, as in PaLI, for image embeddings
 
-        if exists(prepend_embeds):
-            prepend_seq, prepend_dim = prepend_embeds.shape[1:]
-            assert prepend_dim == x.shape[-1], 'prepended embeddings need to have same dimensions as text model dimensions'
+            if exists(prepend_embeds):
+                prepend_seq, prepend_dim = prepend_embeds.shape[1:]
+                assert prepend_dim == x.shape[-1], 'prepended embeddings need to have same dimensions as text model dimensions'
 
-            x = torch.cat((prepend_embeds, x), dim = -2)
+                x = torch.cat((prepend_embeds, x), dim = -2)
 
-            if exists(prepend_mask) or exists(mask):
-                mask = default(mask, lambda: torch.ones((b, n), device = device, dtype = torch.bool))
-                prepend_mask = default(prepend_mask, lambda: torch.ones((b, prepend_seq), device = device, dtype = torch.bool))
+                if exists(prepend_mask) or exists(mask):
+                    mask = default(mask, lambda: torch.ones((b, n), device = device, dtype = torch.bool))
+                    prepend_mask = default(prepend_mask, lambda: torch.ones((b, prepend_seq), device = device, dtype = torch.bool))
 
-                mask = torch.cat((prepend_mask, mask), dim = -1)
+                    mask = torch.cat((prepend_mask, mask), dim = -1)
 
-        # whether to reduce the gradient going to the embedding, from cogview paper, corroborated by GLM-130B model
+            # whether to reduce the gradient going to the embedding, from cogview paper, corroborated by GLM-130B model
 
-        if emb_frac_gradient < 1:
-            assert emb_frac_gradient > 0
-            x = x * emb_frac_gradient + x.detach() * (1 - emb_frac_gradient)
+            if emb_frac_gradient < 1:
+                assert emb_frac_gradient > 0
+                x = x * emb_frac_gradient + x.detach() * (1 - emb_frac_gradient)
 
-        # embedding dropout
+            # embedding dropout
 
-        x = self.emb_dropout(x)
+            x = self.emb_dropout(x)
 
-        x = self.project_emb(x)
+            x = self.project_emb(x)
 
-        if has_memory_tokens:
-            mem_every = self.memory_tokens_interspersed_every
+            if has_memory_tokens:
+                mem_every = self.memory_tokens_interspersed_every
 
-            if exists(mem_every):
-                assert mem_every > 0
-                assert isinstance(self.attn_layers, Decoder), 'only for decoder'
-                next_seq_len = math.ceil(n / mem_every) * mem_every
+                if exists(mem_every):
+                    assert mem_every > 0
+                    assert isinstance(self.attn_layers, Decoder), 'only for decoder'
+                    next_seq_len = math.ceil(n / mem_every) * mem_every
 
-                x = pad_at_dim(x, (0, next_seq_len - n), dim = -2, value = 0.)
-                x = rearrange(x, 'b (n m) d -> (b n) m d', m = mem_every)
+                    x = pad_at_dim(x, (0, next_seq_len - n), dim = -2, value = 0.)
+                    x = rearrange(x, 'b (n m) d -> (b n) m d', m = mem_every)
 
-            mem = repeat(self.memory_tokens, 'n d -> b n d', b = x.shape[0])
-            x, mem_packed_shape = pack((mem, x), 'b * d')
+                mem = repeat(self.memory_tokens, 'n d -> b n d', b = x.shape[0])
+                x, mem_packed_shape = pack((mem, x), 'b * d')
 
-            # auto-handle masking after appending memory tokens
-            if not exists(mem_every) and exists(mask):
-                mask = pad_at_dim(mask, (num_mems, 0), dim = -1, value = True)
+                # auto-handle masking after appending memory tokens
+                if not exists(mem_every) and exists(mask):
+                    mask = pad_at_dim(mask, (num_mems, 0), dim = -1, value = True)
 
-            if exists(mem_every):
-                x = rearrange(x, '(b n) m d -> b (n m) d', b = b)
+                if exists(mem_every):
+                    x = rearrange(x, '(b n) m d -> b (n m) d', b = b)
 
-        if self.shift_mem_down and exists(mems):
-            mems_l, mems_r = mems[:self.shift_mem_down], mems[self.shift_mem_down:]
-            mems = [*mems_r, *mems_l]
+            if self.shift_mem_down and exists(mems):
+                mems_l, mems_r = mems[:self.shift_mem_down], mems[self.shift_mem_down:]
+                mems = [*mems_r, *mems_l]
 
-        x, intermediates = self.attn_layers(x, mask = mask, mems = mems, mem_masks = mem_masks, cache = cache, return_hiddens = True, seq_start_pos = seq_start_pos, **kwargs)
-
-        if has_memory_tokens:
-            if exists(mem_every):
-                x = rearrange(x, 'b (n m) d -> (b n) m d', m = (mem_every + num_mems))
-
-            mem, x = unpack(x, mem_packed_shape, 'b * d')
-
-            intermediates.memory_tokens = mem
-
-            if exists(mem_every):
-                x = rearrange(x, '(b n) m d -> b (n m) d', b = b)
-
-            x = x[:, :n]
-
-        if return_logits_and_embeddings:
-            out = (self.to_logits(x), x)
-        elif return_embeddings:
-            out = x
         else:
-            out = self.to_logits(x)
+            x = x
 
-        if return_attn_z_loss:
-            pre_softmax_attns = list(map(lambda t: t.pre_softmax_attn, intermediates.attn_intermediates))
-            intermediates.attn_z_loss = calc_z_loss(pre_softmax_attns, weight = attn_z_loss_weight)
-            return_intermediates = True
+        x, intermediates = self.attn_layers(x, mask = mask, mems = mems, mem_masks = mem_masks, cache = cache, return_hiddens = True, seq_start_pos = seq_start_pos, slice_num = slice_num, slice_id = slice_id, **kwargs)
 
-        if return_mems:
-            hiddens = intermediates.hiddens
-            new_mems = list(map(lambda pair: torch.cat(pair, dim = -2), zip(mems, hiddens))) if exists(mems) else hiddens
-            new_mems = list(map(lambda t: t[..., -self.max_mem_len:, :].detach(), new_mems))
+        if post_compute:
+            if has_memory_tokens:
+                if exists(mem_every):
+                    x = rearrange(x, 'b (n m) d -> (b n) m d', m = (mem_every + num_mems))
 
-            if not return_intermediates:
-                return out, new_mems
+                mem, x = unpack(x, mem_packed_shape, 'b * d')
 
-            intermediates.mems = new_mems
+                intermediates.memory_tokens = mem
 
-        if return_intermediates:
-            return out, intermediates
+                if exists(mem_every):
+                    x = rearrange(x, '(b n) m d -> b (n m) d', b = b)
 
-        if return_attn:
-            attn_maps = list(map(lambda t: t.post_softmax_attn, intermediates.attn_intermediates))
-            return out, attn_maps
+                x = x[:, :n]
 
-        return out
+            if return_logits_and_embeddings:
+                out = (self.to_logits(x), x)
+            elif return_embeddings:
+                out = x
+            else:
+                out = self.to_logits(x)
+
+            if return_attn_z_loss:
+                pre_softmax_attns = list(map(lambda t: t.pre_softmax_attn, intermediates.attn_intermediates))
+                intermediates.attn_z_loss = calc_z_loss(pre_softmax_attns, weight = attn_z_loss_weight)
+                return_intermediates = True
+
+            if return_mems:
+                hiddens = intermediates.hiddens
+                new_mems = list(map(lambda pair: torch.cat(pair, dim = -2), zip(mems, hiddens))) if exists(mems) else hiddens
+                new_mems = list(map(lambda t: t[..., -self.max_mem_len:, :].detach(), new_mems))
+
+                if not return_intermediates:
+                    return out, new_mems
+
+                intermediates.mems = new_mems
+
+            if return_intermediates:
+                return out, intermediates
+
+            if return_attn:
+                attn_maps = list(map(lambda t: t.post_softmax_attn, intermediates.attn_intermediates))
+                return out, attn_maps
+        else:
+            return x, intermediates
 
 class XTransformer(nn.Module):
     def __init__(

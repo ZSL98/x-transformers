@@ -7,7 +7,8 @@ from x_transformers.x_transformers import (
     Attention,
     TransformerWrapper,
     ViTransformerWrapper,
-    AttentionLayers
+    AttentionLayers,
+    LayerIntermediates
 )
 
 from x_transformers.autoregressive_wrapper import AutoregressiveWrapper

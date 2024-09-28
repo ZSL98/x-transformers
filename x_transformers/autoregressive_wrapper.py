@@ -272,7 +272,7 @@ class AutoregressiveWrapper(Module):
 
     def make_graph(
         self,
-        prompts,
+        graph_input,
         seq_len,
         eos_token = None,
         temperature = 1.,
@@ -288,23 +288,22 @@ class AutoregressiveWrapper(Module):
         cache_kv = True,
         kv_cache = None,
         supercache = None,
+        slice_num = 1,
+        slice_id = 0,
+        pre_compute = True,
+        post_compute = True,
         **kwargs
     ):
-        max_seq_len, device = self.max_seq_len, prompts.device
-        prompts, ps = pack([prompts], '* n')
-        b, t = prompts.shape
+        max_seq_len, device = self.max_seq_len, graph_input.device
+        graph_input, ps = pack([graph_input], '* n')
+        b, t = graph_input.shape
         seq_start_pos = None
         if exists(prompt_lens):
-            prompts = align_right(prompts, prompt_lens, pad_id = self.pad_value)
+            graph_input = align_right(graph_input, prompt_lens, pad_id = self.pad_value)
             seq_start_pos = t - prompt_lens
 
         # output from which sampled tokens appended to
-
-        out = prompts
-
-        # kv caches
-        cache = kv_cache
-
+        out = graph_input
         # sampling up to seq_len
         if restrict_to_max_seq_len:
             x = out[:, -max_seq_len:]
@@ -314,9 +313,11 @@ class AutoregressiveWrapper(Module):
         logits, new_cache = self.net(
             x,
             return_intermediates = True,
-            cache = cache,
-            seq_start_pos = seq_start_pos,
-            supercache = supercache,
+            cache = kv_cache,
+            pre_compute = pre_compute,
+            post_compute = post_compute,
+            slice_num = slice_num,
+            slice_id = slice_id,
             **kwargs
         )
         # alloc = torch.cuda.memory_allocated()
