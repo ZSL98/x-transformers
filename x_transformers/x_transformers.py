@@ -1381,6 +1381,7 @@ class AttentionLayers(nn.Module):
             pre_norm, post_branch_norm, post_main_norm = norm
 
             if exists(pre_norm):
+                x = x.to(torch.bfloat16)
                 x = pre_norm(x)
 
                 if layer_type == 'a' and exists(layer_mem):
@@ -1427,6 +1428,7 @@ class AttentionLayers(nn.Module):
         if self.resi_dual:
             x = x + self.final_norm(outer_residual)
         else:
+            x = x.to(torch.bfloat16)
             x = self.final_norm(x)
 
         if not return_hiddens:
@@ -1522,9 +1524,9 @@ class ViTransformerWrapper(nn.Module):
             self.register_tokens = nn.Parameter(torch.randn(num_register_tokens, dim))
 
         self.patch_to_embedding = nn.Sequential(
-            LayerNorm(patch_dim),
-            nn.Linear(patch_dim, dim),
-            LayerNorm(dim)
+            LayerNorm(patch_dim).to(torch.bfloat16),
+            nn.Linear(patch_dim, dim).to(torch.bfloat16),
+            LayerNorm(dim).to(torch.bfloat16)
         )
 
         self.post_emb_norm = LayerNorm(dim) if post_emb_norm else nn.Identity()
@@ -1545,6 +1547,7 @@ class ViTransformerWrapper(nn.Module):
         b, p = img.shape[0], self.patch_size
 
         x = rearrange(img, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = p, p2 = p)
+        x = x.to(torch.bfloat16)
         x = self.patch_to_embedding(x)
         n = x.shape[1]
 
@@ -1800,7 +1803,8 @@ class TransformerWrapper(nn.Module):
             elif return_embeddings:
                 out = x
             else:
-                out = self.to_logits(x)
+                x = x.to(torch.bfloat16)
+                out = self.to_logits.to(torch.bfloat16)(x)
 
             if return_attn_z_loss:
                 pre_softmax_attns = list(map(lambda t: t.pre_softmax_attn, intermediates.attn_intermediates))
